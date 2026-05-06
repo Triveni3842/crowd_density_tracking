@@ -1,1 +1,609 @@
+# detector.py
+# YOLOv8 + Webcam + Proper Tracking
 
+import cv2
+import requests
+from ultralytics import YOLO
+from analytics import analyze
+
+model = YOLO("yolov8n.pt")
+model.overrides['imgsz'] = 320
+
+SERVER_URL = "http://127.0.0.1:5000/crowd-data"
+
+entry_count = 0
+exit_count = 0
+known_ids = set()  # IDs currently in frame
+
+def send_to_server(data):
+    try:
+        requests.post(SERVER_URL, json=data, timeout=1)
+    except Exception:
+        pass
+
+def get_frame_and_count(cap):
+    global entry_count, exit_count, known_ids
+
+    ret, frame = cap.read()
+    if not ret:
+        return None, 0, []
+
+    frame_height = frame.shape[0]
+    frame_width  = frame.shape[1]
+
+    results = model.track(frame, persist=True, verbose=False)
+
+    people_count = 0
+    bounding_boxes = []
+    current_ids = set()
+
+    if results[0].boxes.id is not None:
+        boxes = results[0].boxes
+
+        for i in range(len(boxes)):
+            cls  = int(boxes.cls[i])
+            conf = float(boxes.conf[i])
+
+            if cls == 0 and conf > 0.4:
+                people_count += 1
+                x1, y1, x2, y2 = map(int, boxes.xyxy[i])
+                person_id = int(boxes.id[i])
+                bounding_boxes.append((x1, y1, x2, y2))
+                current_ids.add(person_id)
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, f"ID:{person_id} {conf:.2f}",
+                            (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+    # New IDs that weren't there before = ENTRY
+    new_entries = current_ids - known_ids
+    entry_count += len(new_entries)
+
+    # IDs that were there but now gone = EXIT
+    new_exits = known_ids - current_ids
+    exit_count += len(new_exits)
+
+    # Update known IDs
+    known_ids = current_ids.copy()
+
+    # Flow direction
+    if len(new_entries) > len(new_exits):
+        direction = "Mostly Moving IN"
+    elif len(new_exits) > len(new_entries):
+        direction = "Mostly Moving OUT"
+    elif people_count > 0:
+        direction = "Mixed Flow"
+    else:
+        direction = "Static / No Movement"
+
+    data = analyze(people_count, bounding_boxes, frame)
+    data["entry"]     = entry_count
+    data["exit"]      = exit_count
+    data["direction"] = direction
+
+    send_to_server({
+        "location":    "Main Camera",
+        "people":      people_count,
+        "density":     data["density_level"],
+        "entry":       entry_count,
+        "exit":        exit_count,
+        "direction":   direction,
+        "zone_counts": data["zone_counts"]
+    })
+
+    color_map = {
+        "Low":    (0, 200, 0),
+        "Medium": (0, 165, 255),
+        "High":   (0, 0, 255),
+    }
+    bar_color = color_map[data["density_level"]]
+
+    cv2.rectangle(frame, (0, 0), (frame_width, 60), bar_color, -1)
+    cv2.putText(frame, f"People: {people_count}",
+                (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(frame, f"Density: {data['density_level']}",
+                (160, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(frame, f"Clusters: {data['clusters']}",
+                (340, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    cv2.rectangle(frame, (0, 60), (frame_width, 100), (50, 50, 50), -1)
+    cv2.putText(frame, f"Entry: {entry_count}",
+                (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(frame, f"Exit: {exit_count}",
+                (160, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(frame, f"Flow: {direction}",
+                (280, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    if data["alert_triggered"]:
+        h = frame.shape[0]
+        cv2.rectangle(frame, (0, h-50), (frame_width, h), (0, 0, 200), -1)
+        cv2.putText(frame, "ALERT: Area too crowded!",
+                    (10, h-15), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9, (255, 255, 255), 2)
+
+    return frame, people_count, bounding_boxes
+if __name__ == "__main__":
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        print("ERROR: Could not open webcam.")
+        exit()
+
+    print("Running — use Ctrl+C to stop.")
+
+    cv2.namedWindow("Crowd Density Tracker", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Crowd Density Tracker", 640, 480)
+
+    while True:
+        frame, count, boxes = get_frame_and_count(cap)
+        if frame is None:
+            break
+        cv2.imshow("Crowd Density Tracker", frame)
+        cv2.waitKey(1)
+
+    cap.release()
+    cv2.destroyAllWindows()
+# analytics.py
+# Crowd Analytics & Flow Analysis + Heatmap + Zones
+
+import time
+import json
+import numpy as np
+import cv2
+
+# ─────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────
+
+AREA_SQ_METERS = 20.0
+ENTRY_LINE_RATIO = 0.5
+FRAME_HEIGHT = 480
+FRAME_WIDTH = 640
+LOW_MAX = 20
+MEDIUM_MAX = 50
+
+# Zone definitions (as % of frame width)
+ZONES = {
+    "Zone A": (0.0, 0.33),
+    "Zone B": (0.33, 0.66),
+    "Zone C": (0.66, 1.0)
+}
+
+# ─────────────────────────────────────────────
+# STATE
+# ─────────────────────────────────────────────
+
+previous_positions = {}
+entry_count = 0
+exit_count = 0
+heatmap_accumulator = None
+
+# ─────────────────────────────────────────────
+# FUNCTION 1: Density Calculation
+# ─────────────────────────────────────────────
+
+def calculate_density(people_count, area=AREA_SQ_METERS):
+    if area <= 0:
+        return 0.0
+    return round(people_count / area, 2)
+
+# ─────────────────────────────────────────────
+# FUNCTION 2: Crowd Level Classification
+# ─────────────────────────────────────────────
+
+def classify_crowd(people_count):
+    if people_count <= LOW_MAX:
+        return "LOW"
+    elif people_count <= MEDIUM_MAX:
+        return "MEDIUM"
+    else:
+        return "HIGH"
+
+# ─────────────────────────────────────────────
+# FUNCTION 3: Entry/Exit & Direction Flow
+# ─────────────────────────────────────────────
+
+def track_flow(current_detections):
+    global previous_positions, entry_count, exit_count
+
+    entry_line_y = FRAME_HEIGHT * ENTRY_LINE_RATIO
+    direction_votes = []
+
+    for detection in current_detections:
+        person_id = detection.get("id")
+        bbox = detection.get("bbox", [0, 0, 0, 0])
+        center_y = bbox[1] + bbox[3] / 2
+
+        if person_id in previous_positions:
+            prev_y = previous_positions[person_id]
+            delta_y = center_y - prev_y
+
+            if delta_y > 2:
+                direction_votes.append("DOWN")
+                if prev_y < entry_line_y <= center_y:
+                    entry_count += 1
+            elif delta_y < -2:
+                direction_votes.append("UP")
+                if prev_y >= entry_line_y > center_y:
+                    exit_count += 1
+
+        previous_positions[person_id] = center_y
+
+    detected_ids = {d.get("id") for d in current_detections}
+    stale_ids = [pid for pid in previous_positions if pid not in detected_ids]
+    for pid in stale_ids:
+        del previous_positions[pid]
+
+    if direction_votes:
+        down_count = direction_votes.count("DOWN")
+        up_count = direction_votes.count("UP")
+        if down_count > up_count:
+            direction_summary = "Mostly Moving IN"
+        elif up_count > down_count:
+            direction_summary = "Mostly Moving OUT"
+        else:
+            direction_summary = "Mixed Flow"
+    else:
+        direction_summary = "Static / No Movement"
+
+    return entry_count, exit_count, direction_summary
+
+# ─────────────────────────────────────────────
+# FUNCTION 4: Cluster Counter
+# ─────────────────────────────────────────────
+
+def count_clusters(bounding_boxes, distance_threshold=150):
+    if not bounding_boxes:
+        return 0
+
+    centers = []
+    for (x1, y1, x2, y2) in bounding_boxes:
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        centers.append((cx, cy))
+
+    visited = set()
+    cluster_count = 0
+
+    for i, (cx1, cy1) in enumerate(centers):
+        if i in visited:
+            continue
+        cluster_count += 1
+        for j, (cx2, cy2) in enumerate(centers):
+            if j in visited:
+                continue
+            dist = ((cx1 - cx2)**2 + (cy1 - cy2)**2) ** 0.5
+            if dist < distance_threshold:
+                visited.add(j)
+
+    return cluster_count
+
+# ─────────────────────────────────────────────
+# FUNCTION 5: Heatmap
+# ─────────────────────────────────────────────
+
+def update_heatmap(frame, bounding_boxes):
+    global heatmap_accumulator
+
+    h, w = frame.shape[:2]
+
+    # Initialize heatmap on first frame
+    if heatmap_accumulator is None:
+        heatmap_accumulator = np.zeros((h, w), dtype=np.float32)
+
+    # Add heat at each person's center
+    for (x1, y1, x2, y2) in bounding_boxes:
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        if 0 <= cx < w and 0 <= cy < h:
+            cv2.circle(heatmap_accumulator, (cx, cy), 60, 3.0, -1)
+
+    # Fade over time so old positions disappear gradually
+    heatmap_accumulator *= 0.95
+
+    # Normalize and apply color
+    heatmap_norm = cv2.normalize(
+        heatmap_accumulator, None, 0, 255, cv2.NORM_MINMAX
+    )
+    heatmap_color = cv2.applyColorMap(
+        heatmap_norm.astype(np.uint8), cv2.COLORMAP_JET
+    )
+
+    # Blend heatmap with original frame
+    overlay = cv2.addWeighted(frame, 0.6, heatmap_color, 0.4, 0)
+    return overlay
+
+# ─────────────────────────────────────────────
+# FUNCTION 6: Zone Monitoring
+# ─────────────────────────────────────────────
+
+def get_zone_counts(bounding_boxes, frame_width=FRAME_WIDTH):
+    zone_counts = {"Zone A": 0, "Zone B": 0, "Zone C": 0}
+
+    for (x1, y1, x2, y2) in bounding_boxes:
+        cx = (x1 + x2) / 2
+        ratio = cx / frame_width
+
+        for zone_name, (start, end) in ZONES.items():
+            if start <= ratio < end:
+                zone_counts[zone_name] += 1
+                break
+
+    return zone_counts
+
+
+def draw_zones(frame, bounding_boxes):
+    h, w = frame.shape[:2]
+    zone_counts = get_zone_counts(bounding_boxes, w)
+
+    zone_colors = {
+        "Zone A": (255, 100, 100),
+        "Zone B": (100, 255, 100),
+        "Zone C": (100, 100, 255)
+    }
+
+    for zone_name, (start_ratio, end_ratio) in ZONES.items():
+        x_start = int(start_ratio * w)
+        x_end = int(end_ratio * w)
+        count = zone_counts[zone_name]
+        color = zone_colors[zone_name]
+
+        # Draw zone border
+        cv2.rectangle(frame, (x_start, 100), (x_end, h), color, 2)
+
+        # Zone label + count
+        cv2.putText(frame, f"{zone_name}: {count}",
+                    (x_start + 5, 130),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        # Highlight zone red if crowded
+        if count > 5:
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (x_start, 100), (x_end, h),
+                          (0, 0, 255), -1)
+            cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
+
+    return frame, zone_counts
+
+# ─────────────────────────────────────────────
+# FUNCTION 7: analyze (called by detector.py)
+# ─────────────────────────────────────────────
+
+def analyze(people_count, bounding_boxes, frame=None):
+    detections = []
+    for i, (x1, y1, x2, y2) in enumerate(bounding_boxes):
+        w = x2 - x1
+        h = y2 - y1
+        detections.append({"id": i, "bbox": [x1, y1, w, h]})
+
+    density_level = classify_crowd(people_count)
+    density_map = {"LOW": "Low", "MEDIUM": "Medium", "HIGH": "High"}
+    density_level = density_map[density_level]
+
+    clusters = count_clusters(bounding_boxes)
+    alert_triggered = (density_level == "High")
+    entry, exit_, direction = track_flow(detections)
+
+    # Zone counts
+    zone_counts = get_zone_counts(
+        bounding_boxes,
+        frame.shape[1] if frame is not None else FRAME_WIDTH
+    )
+
+    return {
+        "density_level": density_level,
+        "clusters": clusters,
+        "alert_triggered": alert_triggered,
+        "entry": entry,
+        "exit": exit_,
+        "direction": direction,
+        "zone_counts": zone_counts
+    }
+
+# ─────────────────────────────────────────────
+# TEST
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("=== Analytics Module Test ===\n")
+    fake_frames = [
+        {
+            "frame": 1,
+            "people_count": 5,
+            "detections": [
+                {"id": 1, "bbox": [100, 100, 50, 100]},
+                {"id": 2, "bbox": [200, 80,  50, 100]},
+                {"id": 3, "bbox": [300, 120, 50, 100]},
+            ]
+        }
+    ]
+    for frame_data in fake_frames:
+        people = frame_data["people_count"]
+        boxes = [(d["bbox"][0], d["bbox"][1],
+                  d["bbox"][0]+d["bbox"][2],
+                  d["bbox"][1]+d["bbox"][3])
+                 for d in frame_data["detections"]]
+        result = analyze(people, boxes)
+        print(json.dumps(result, indent=2))
+
+
+# server.py
+# Flask Backend + MQTT
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import paho.mqtt.client as mqtt
+import json
+import time
+
+app = Flask(__name__)
+CORS(app)
+
+latest_data = {}
+
+broker = "broker.hivemq.com"
+topic = "crowd/data"
+alert_topic = "crowd/alert"
+
+mqtt_client = mqtt.Client()
+mqtt_client.connect(broker, 1883, 60)
+
+ALERT_THRESHOLD = 80
+
+@app.route('/crowd-data', methods=['POST'])
+def receive_data():
+    global latest_data
+    data = request.json
+    data["timestamp"] = time.time()
+    latest_data = data
+    print("Received:", data)
+
+    mqtt_client.publish(topic, json.dumps(data))
+
+    if data.get("people", 0) > ALERT_THRESHOLD:
+        mqtt_client.publish(alert_topic, "HIGH CROWD ALERT")
+        print("ALERT TRIGGERED")
+
+    return jsonify({"status": "success"}), 200
+
+@app.route('/get-data', methods=['GET'])
+def get_data():
+    return jsonify(latest_data)
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
+# dashboard.py
+# Streamlit Dashboard (Live Data)
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import requests
+import time
+
+st.set_page_config(page_title="Crowd Dashboard", layout="wide")
+
+st.markdown("""
+<style>
+.stApp {
+    background: linear-gradient(135deg, #1e3c72, #2a5298);
+    color: white;
+}
+.title {
+    text-align: center;
+    font-size: 42px;
+    font-weight: bold;
+    margin-bottom: 20px;
+}
+.card {
+    background: rgba(255, 255, 255, 0.12);
+    backdrop-filter: blur(10px);
+    padding: 25px;
+    border-radius: 15px;
+    text-align: center;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+}
+.metric {
+    font-size: 32px;
+    font-weight: bold;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<div class="title">AI Based Crowd Density and Flow Tracker</div>',
+            unsafe_allow_html=True)
+
+SERVER_URL = "http://127.0.0.1:5000/get-data"
+
+# History for graph
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+# Fetch live data
+def fetch_data():
+    try:
+        r = requests.get(SERVER_URL, timeout=2)
+        return r.json()
+    except Exception:
+        return None
+
+data = fetch_data()
+
+if data:
+    people  = data.get("people", 0)
+    density = data.get("density", "Low")
+    entry   = data.get("entry", 0)
+    exit_   = data.get("exit", 0)
+    direction = data.get("direction", "N/A")
+    zone_counts = data.get("zone_counts", {})
+
+    # Save to history
+    st.session_state.history.append(people)
+    if len(st.session_state.history) > 20:
+        st.session_state.history.pop(0)
+else:
+    people, density, entry, exit_ = 0, "Low", 0, 0
+    direction, zone_counts = "N/A", {}
+
+# ── Row 1: Main metrics ──
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.markdown(f"""
+    <div class="card"><h3>👥 People</h3>
+    <div class="metric">{people}</div></div>
+    """, unsafe_allow_html=True)
+with col2:
+    st.markdown(f"""
+    <div class="card"><h3>📊 Density</h3>
+    <div class="metric">{density}</div></div>
+    """, unsafe_allow_html=True)
+with col3:
+    st.markdown(f"""
+    <div class="card"><h3>🚪 Entry</h3>
+    <div class="metric">{entry}</div></div>
+    """, unsafe_allow_html=True)
+with col4:
+    st.markdown(f"""
+    <div class="card"><h3>🚶 Exit</h3>
+    <div class="metric">{exit_}</div></div>
+    """, unsafe_allow_html=True)
+
+st.write("")
+
+# ── Row 2: Flow + Zones ──
+col5, col6 = st.columns(2)
+with col5:
+    st.markdown(f"""
+    <div class="card"><h3>🧭 Flow Direction</h3>
+    <div class="metric" style="font-size:22px">{direction}</div></div>
+    """, unsafe_allow_html=True)
+with col6:
+    st.markdown("#### 📍 Zone Counts")
+    if zone_counts:
+        for zone, count in zone_counts.items():
+            st.progress(min(count / 10, 1.0), text=f"{zone}: {count} people")
+    else:
+        st.write("No zone data yet")
+
+st.write("")
+
+# ── Alert ──
+if density == "High":
+    st.error("🚨 High Crowd Density! Take Action Immediately!")
+elif density == "Medium":
+    st.warning("⚠️ Moderate Crowd Level")
+else:
+    st.success("✅ Crowd Level Normal")
+
+# ── Graph ──
+st.write("### 📈 Live People Count (Last 20 Readings)")
+if st.session_state.history:
+    chart_data = pd.DataFrame({
+        "People": st.session_state.history
+    })
+    st.line_chart(chart_data)
+
+# ── Auto refresh every 2 seconds ──
+time.sleep(2)
+st.rerun()
